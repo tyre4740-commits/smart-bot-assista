@@ -1,0 +1,1244 @@
+import asyncio
+import hashlib
+import json
+import urllib.error
+import urllib.request
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import tempfile
+import time
+import zipfile
+import py_compile
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlparse
+
+import yt_dlp
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram.constants import ChatAction, ParseMode, ChatMemberStatus
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
+from telegram.request import HTTPXRequest
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "49"))
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+CACHE_DB = BASE_DIR / "music_cache.db"
+MUSIC_CACHE_DIR = BASE_DIR / "music_cache"
+MUSIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_OWNER_ID = int(os.getenv("OWNER_ID", "6977591596"))
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(3)
+WEBSITE_URL = "https://qiqiq7i-wmgt2cpc.manus.space"
+WEBSITE_BROADCAST_VERSION = "1"
+WEBSITE_NOTICE_VERSION = "2"
+
+# معرّف شعار البرق الأبيض من حزمة الإيموجي التي أرسلها المستخدم.
+LIGHTNING_EMOJI_ID = "5307580456793827297"
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("fast_music_bot")
+
+
+class BotError(Exception):
+    pass
+
+
+def init_cache() -> None:
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS music_cache (
+                query_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                telegram_file_id TEXT NOT NULL,
+                file_unique_id TEXT,
+                source_url TEXT,
+                duration INTEGER,
+                file_size INTEGER DEFAULT 0,
+                cache_path TEXT,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_name TEXT,
+                username TEXT,
+                first_seen INTEGER NOT NULL,
+                last_activity INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                start_count INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # إضافة عداد /start للنسخ القديمة من قاعدة البيانات بدون حذف أي بيانات.
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN start_count INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id INTEGER NOT NULL,
+                query_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                telegram_file_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, query_key)
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS download_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                query_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                source_url TEXT,
+                from_cache INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS managed_chats (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT NOT NULL,
+                title TEXT,
+                username TEXT,
+                owner_id INTEGER,
+                added_by_id INTEGER,
+                added_at INTEGER NOT NULL,
+                last_status TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS secondary_developers (
+                user_id INTEGER PRIMARY KEY,
+                added_at INTEGER NOT NULL,
+                added_by INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS force_subscription_channels (
+                channel_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                username TEXT,
+                invite_link TEXT,
+                added_at INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        db.commit()
+
+        # دعم قواعد البيانات القديمة بدون حذف أي بيانات موجودة.
+        columns = {row[1] for row in db.execute("PRAGMA table_info(music_cache)").fetchall()}
+        for name, definition in (
+            ("source_url", "TEXT"),
+            ("duration", "INTEGER"),
+            ("file_size", "INTEGER DEFAULT 0"),
+            ("cache_path", "TEXT"),
+        ):
+            if name not in columns:
+                db.execute(f"ALTER TABLE music_cache ADD COLUMN {name} {definition}")
+
+        defaults = {
+            "owner_id": str(DEFAULT_OWNER_ID),
+            "bot_enabled": "1",
+            "notifications_enabled": "0",
+            "announcements_enabled": "0",
+            "announcement_channel": "",
+            "start_photo": "",
+            "play_photo": "",
+            "notifications_group": "",
+            "download_count": "0",
+            "website_broadcast_version": "0",
+            "website_notice_version": "0",
+            "force_subscription_enabled": "1",
+        }
+        for key, value in defaults.items():
+            db.execute(
+                "INSERT OR IGNORE INTO bot_settings(key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
+        # إصدار مستقل لرسالة الموقع: عند تثبيت هذه النسخة لأول مرة،
+        # نعيد عداد /start إلى الصفر حتى يحصل كل مستخدم على رسالة الموقع
+        # في أول /start له مع هذه النسخة، حتى لو كان قد استخدم نسخة أقدم.
+        current_notice_version = db.execute(
+            "SELECT value FROM bot_settings WHERE key=?",
+            ("website_notice_version",),
+        ).fetchone()
+        if not current_notice_version or current_notice_version[0] != WEBSITE_NOTICE_VERSION:
+            db.execute("UPDATE users SET start_count=0")
+            db.execute(
+                "UPDATE bot_settings SET value=? WHERE key=?",
+                (WEBSITE_NOTICE_VERSION, "website_notice_version"),
+            )
+        db.commit()
+
+
+def setting_get(key: str, default: str = "") -> str:
+    with sqlite3.connect(CACHE_DB) as db:
+        row = db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def setting_set(key: str, value: str) -> None:
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute(
+            "INSERT INTO bot_settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        db.commit()
+
+
+def owner_id() -> int:
+    try:
+        return int(setting_get("owner_id", str(DEFAULT_OWNER_ID)))
+    except ValueError:
+        return DEFAULT_OWNER_ID
+
+
+def force_subscription_channels():
+    with sqlite3.connect(CACHE_DB) as db:
+        return db.execute(
+            "SELECT channel_id, title, username, invite_link FROM force_subscription_channels "
+            "WHERE enabled=1 ORDER BY added_at"
+        ).fetchall()
+
+
+def normalize_channel(value: str) -> str:
+    value = value.strip()
+    if value.startswith("https://t.me/"):
+        value = value.rstrip("/").split("/")[-1]
+    if value.startswith("@"):
+        return value
+    if re.fullmatch(r"-?\d+", value):
+        return value
+    return "@" + value
+
+
+def subscription_keyboard(channels) -> InlineKeyboardMarkup:
+    rows = []
+    for channel_id, title, username, invite_link in channels:
+        link = invite_link or (f"https://t.me/{username}" if username else None)
+        if link:
+            rows.append([InlineKeyboardButton(f"📢 {title[:50]}", url=link)])
+    rows.append([InlineKeyboardButton("✅ تحققت من الاشتراك", callback_data="check_subscription")])
+    return InlineKeyboardMarkup(rows)
+
+
+def subscription_text(channels) -> str:
+    lines = ["🔒 <b>الاشتراك الإجباري</b>", "\nيجب الاشتراك في القنوات التالية أولًا ثم الضغط على زر التحقق:"]
+    for _, title, username, _ in channels:
+        suffix = f" (@{username.lstrip('@')})" if username else ""
+        lines.append(f"• {title}{suffix}")
+    return "\n".join(lines)
+
+
+async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    if setting_get("force_subscription_enabled", "1") != "1" or is_developer(user_id):
+        return True
+    channels = force_subscription_channels()
+    if not channels:
+        return True
+    for channel_id, _, _, _ in channels:
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            if str(member.status) not in {"member", "administrator", "creator", "ChatMemberStatus.MEMBER", "ChatMemberStatus.ADMINISTRATOR", "ChatMemberStatus.OWNER"}:
+                return False
+        except TelegramError as exc:
+            logger.warning("force subscription check failed for %s: %s", channel_id, exc)
+            return False
+    return True
+
+
+async def require_subscription(message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = getattr(message, "from_user", None)
+    if not user or await is_user_subscribed(context, user.id):
+        return True
+    channels = force_subscription_channels()
+    await message.reply_text(subscription_text(channels), parse_mode=ParseMode.HTML, reply_markup=subscription_keyboard(channels))
+    return False
+
+
+def is_developer(user_id: int | None) -> bool:
+    """المطور الأساسي + المطورون الثانويون لهم كامل صلاحيات قسم المطور."""
+    if user_id is None:
+        return False
+    if user_id == DEFAULT_OWNER_ID or user_id == owner_id():
+        return True
+    with sqlite3.connect(CACHE_DB) as db:
+        return db.execute("SELECT 1 FROM secondary_developers WHERE user_id=?", (user_id,)).fetchone() is not None
+
+
+def is_owner(user_id: int | None) -> bool:
+    """صلاحية المالك التشغيلية، مع بقاء المطور الأساسي أعلى صلاحية."""
+    return user_id is not None and (user_id == owner_id() or user_id == DEFAULT_OWNER_ID)
+
+
+def register_user(user) -> None:
+    if not user:
+        return
+    now = int(time.time())
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute("""
+            INSERT INTO users(user_id, first_name, username, first_seen, last_activity, status)
+            VALUES (?, ?, ?, ?, ?, 'active')
+            ON CONFLICT(user_id) DO UPDATE SET
+                first_name=excluded.first_name,
+                username=excluded.username,
+                last_activity=excluded.last_activity,
+                status='active'
+        """, (user.id, user.first_name or "", user.username or "", now, now))
+        db.commit()
+
+
+def add_download_history(user_id: int, query: str, title: str, source_url: str | None, from_cache: bool) -> None:
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute(
+            """INSERT INTO download_history
+               (user_id, query_key, title, source_url, from_cache, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, normalize_query(query), title, source_url, 1 if from_cache else 0, int(time.time()))
+        )
+        db.commit()
+
+
+def favorite_add(user_id: int, query: str, title: str, file_id: str) -> None:
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute(
+            """INSERT INTO favorites(user_id, query_key, title, telegram_file_id, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, query_key) DO UPDATE SET
+                   title=excluded.title, telegram_file_id=excluded.telegram_file_id,
+                   created_at=excluded.created_at""",
+            (user_id, normalize_query(query), title, file_id, int(time.time()))
+        )
+        db.commit()
+
+
+def favorite_remove(user_id: int, query: str) -> None:
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute("DELETE FROM favorites WHERE user_id=? AND query_key=?",
+                   (user_id, normalize_query(query)))
+        db.commit()
+
+
+def favorite_has(user_id: int, query: str) -> bool:
+    with sqlite3.connect(CACHE_DB) as db:
+        return db.execute(
+            "SELECT 1 FROM favorites WHERE user_id=? AND query_key=?",
+            (user_id, normalize_query(query))
+        ).fetchone() is not None
+
+
+def favorite_list(user_id: int):
+    with sqlite3.connect(CACHE_DB) as db:
+        return db.execute(
+            "SELECT title, query_key, telegram_file_id FROM favorites WHERE user_id=? ORDER BY created_at DESC",
+            (user_id,)
+        ).fetchall()
+
+
+def history_list(user_id: int, limit: int = 10):
+    with sqlite3.connect(CACHE_DB) as db:
+        return db.execute(
+            "SELECT title, created_at, from_cache FROM download_history "
+            "WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit)
+        ).fetchall()
+
+
+def user_profile(user_id: int):
+    with sqlite3.connect(CACHE_DB) as db:
+        user = db.execute(
+            "SELECT first_name, username, first_seen, last_activity, status FROM users WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+        downloads = db.execute(
+            "SELECT COUNT(*) FROM download_history WHERE user_id=?", (user_id,)
+        ).fetchone()[0]
+        favorites = db.execute(
+            "SELECT COUNT(*) FROM favorites WHERE user_id=?", (user_id,)
+        ).fetchone()[0]
+    return user, downloads, favorites
+
+
+def cache_get(query: str):
+    key = normalize_query(query)
+    with sqlite3.connect(CACHE_DB) as db:
+        row = db.execute(
+            "SELECT title, telegram_file_id, source_url, duration, file_size, cache_path "
+            "FROM music_cache WHERE query_key = ?",
+            (key,),
+        ).fetchone()
+    return row
+
+
+def cache_put(query: str, title: str, file_id: str, unique_id: str | None,
+              source_url: str | None = None, duration: int | None = None,
+              file_size: int = 0, cache_path: str | None = None) -> None:
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute("""
+            INSERT INTO music_cache
+                (query_key, title, telegram_file_id, file_unique_id, source_url,
+                 duration, file_size, cache_path, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(query_key) DO UPDATE SET
+                title=excluded.title,
+                telegram_file_id=excluded.telegram_file_id,
+                file_unique_id=excluded.file_unique_id,
+                source_url=excluded.source_url,
+                duration=excluded.duration,
+                file_size=excluded.file_size,
+                cache_path=excluded.cache_path,
+                created_at=excluded.created_at
+        """, (
+            normalize_query(query), title, file_id, unique_id, source_url,
+            duration, file_size, cache_path, int(time.time())
+        ))
+        db.commit()
+
+
+def stats():
+    now = int(time.time())
+    day = now - 86400
+    with sqlite3.connect(CACHE_DB) as db:
+        total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        new_users = db.execute("SELECT COUNT(*) FROM users WHERE first_seen >= ?", (day,)).fetchone()[0]
+        active = db.execute("SELECT COUNT(*) FROM users WHERE last_activity >= ?", (day,)).fetchone()[0]
+        songs = db.execute("SELECT COUNT(*) FROM music_cache").fetchone()[0]
+        cache_size = db.execute("SELECT COALESCE(SUM(file_size), 0) FROM music_cache").fetchone()[0]
+        favorites = db.execute("SELECT COUNT(*) FROM favorites").fetchone()[0]
+        history = db.execute("SELECT COUNT(*) FROM download_history").fetchone()[0]
+        chats = db.execute("SELECT COUNT(*) FROM managed_chats").fetchone()[0]
+    try:
+        downloads = int(setting_get("download_count", "0"))
+    except ValueError:
+        downloads = 0
+    return total, new_users, active, songs, cache_size, downloads, favorites, history, chats
+
+
+def format_size(size: int) -> str:
+    value = float(size or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def normalize_query(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def favorite_callback_key(value: str) -> str:
+    """مفتاح قصير وآمن ضمن حد Telegram للـ callback_data (64 بايت)."""
+    return hashlib.sha256(normalize_query(value).encode("utf-8")).hexdigest()[:20]
+
+
+def is_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    except ValueError:
+        return False
+
+
+def clean_title(value: str) -> str:
+    value = re.sub(r'[\\/:*?"<>|\n\r\t]+', "_", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    return (value or "audio")[:160]
+
+
+def yt_options() -> dict:
+    # إعدادات أسرع وأكثر تحملاً لانقطاعات SSL مع YouTube.
+    # لا نفرض IPv4 لأن بعض الخوادم/الشبكات تعطي EOF عند إجباره.
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 12,
+        "retries": 4,
+        "fragment_retries": 3,
+        "extractor_retries": 4,
+        "file_access_retries": 2,
+        "cachedir": False,
+        "overwrites": True,
+    }
+
+
+def short_error(exc: Exception) -> str:
+    text = " ".join(str(exc).split())
+    low = text.lower()
+    if "sign in" in low or "not a bot" in low:
+        return "YouTube طلب تسجيل الدخول أو منع الطلب الآلي"
+    if "private video" in low or "members-only" in low:
+        return "الفيديو خاص أو للأعضاء فقط"
+    if "http error 403" in low or "403 forbidden" in low:
+        return ("YouTube رفض طلب التنزيل (403). حدّث yt-dlp إلى أحدث إصدار على الاستضافة "
+                "ثم أعد المحاولة؛ بعض الفيديوهات قد تبقى محجوبة من جهة YouTube.")
+    if "file is larger than" in low or "maximum file size" in low:
+        return "حجم الملف أكبر من الحد المسموح."
+    return text[:220] or "خطأ غير معروف"
+
+
+def download_audio_sync(query: str, workdir: str) -> tuple[str, str, str, int | None]:
+    if is_url(query):
+        source = query
+        selected_title = "audio"
+    else:
+        # نبحث عن أول نتيجة فقط: هذا يقلل زمن الاستجابة بشكل واضح.
+        simplified = re.sub(r"[()\[\]{}]", " ", query)
+        simplified = re.sub(r"\s+", " ", simplified).strip()
+        search_queries = list(dict.fromkeys([query, simplified]))
+        entries = []
+        last_search_error = None
+
+        for search_query in search_queries:
+            # محاولات قصيرة مستقلة؛ إذا حصل SSL EOF نعيد الاتصال بدل إيقاف الطلب فوراً.
+            for attempt in range(3):
+                try:
+                    search_options = yt_options()
+                    search_options.update({
+                        "extract_flat": True,
+                        "skip_download": True,
+                    })
+                    with yt_dlp.YoutubeDL(search_options) as ydl:
+                        search_result = ydl.extract_info(
+                            f"ytsearch1:{search_query}", download=False
+                        )
+                    entries = [
+                        item for item in (search_result or {}).get("entries", [])
+                        if item
+                    ]
+                    if entries:
+                        break
+                except Exception as exc:
+                    last_search_error = exc
+                    if attempt < 2:
+                        time.sleep(0.35 * (attempt + 1))
+            if entries:
+                break
+
+        if not entries:
+            error_text = short_error(last_search_error) if last_search_error else "لا توجد نتائج"
+            if "unexpected_eof" in error_text.lower() or "ssl" in error_text.lower():
+                raise BotError("تعذر الاتصال بـ YouTube مؤقتًا. أعد المحاولة بعد لحظات.")
+            raise BotError(f"فشل البحث في YouTube: {error_text}")
+
+        first = entries[0]
+        source = (
+            first.get("webpage_url")
+            or first.get("original_url")
+            or first.get("url")
+        )
+        if source and not str(source).startswith(("http://", "https://")):
+            source = f"https://www.youtube.com/watch?v={source}"
+        if not source:
+            raise BotError("نتيجة البحث لا تحتوي على رابط قابل للتنزيل.")
+        selected_title = first.get("title") or "audio"
+
+    # اسم الملف مبني على معرّف الفيديو لتجنب أسماء طويلة أو رموز غير صالحة.
+    output_template = str(Path(workdir) / "%(id)s.%(ext)s")
+    options = yt_options()
+    options["outtmpl"] = output_template
+    options["http_headers"] = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+            "Chrome/124.0 Mobile Safari/537.36"
+        ),
+        "Referer": "https://www.youtube.com/",
+    }
+
+    # فضّل M4A لتوافق Telegram، لكن اسمح بأي مسار صوتي متاح بدل فشل
+    # كل نتيجة لا تحتوي على M4A. لا يتم إجراء تحويل بواسطة FFmpeg.
+    options["format"] = "bestaudio[ext=m4a]/bestaudio/best[ext=m4a]/best"
+    last_error = None
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(source, download=True)
+            title = clean_title(info.get("title") or selected_title)
+    except Exception as exc:
+        last_error = exc
+        for partial in Path(workdir).glob("*.part"):
+            partial.unlink(missing_ok=True)
+        raise BotError(f"فشل تنزيل الصوت من YouTube: {short_error(last_error)}") from last_error
+
+    extensions = {".mp3", ".m4a", ".webm", ".opus", ".ogg", ".aac", ".mp4"}
+    files = [
+        p for p in Path(workdir).iterdir()
+        if p.is_file() and p.suffix.lower() in extensions and not p.name.endswith(".part")
+    ]
+    if not files:
+        raise BotError("لم يُنشأ ملف صوتي قابل للإرسال. جرّب رابطًا آخر أو حدّث yt-dlp.")
+    path = max(files, key=lambda p: p.stat().st_mtime)
+    if path.suffix.lower() not in {".mp3", ".m4a", ".mp4", ".webm", ".opus", ".ogg", ".aac"}:
+        raise BotError("صيغة الملف الناتج غير مدعومة. جرّب رابطًا آخر.")
+    duration = None
+    try:
+        duration_value = info.get("duration")
+        duration = int(duration_value) if duration_value else None
+    except Exception:
+        pass
+    return str(path), title, str(source), duration
+
+
+def parse_query(text: str) -> str | None:
+    patterns = (
+        r"^يوت\s+(.+)$",
+        r"^/yt(?:@\w+)?\s+(.+)$",
+        r"^/youtube(?:@\w+)?\s+(.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text.strip(), flags=re.IGNORECASE | re.DOTALL)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return None
+
+
+def success_caption() -> str:
+    return (
+        "<b>⌯︙ تم التحميل بنجاح 𝟼𝟼𝟼 "
+        f'<tg-emoji emoji-id="{LIGHTNING_EMOJI_ID}">⚡</tg-emoji></b>\n'
+        "<b>⌯︙ @sjxn_200</b>"
+    )
+
+
+async def send_cached(message, title: str, file_id: str, query: str | None = None) -> None:
+    user_id = getattr(getattr(message, "from_user", None), "id", 0)
+    fav = favorite_has(user_id, query or title)
+    button = "⭐ مُفضلة" if not fav else "💫 إزالة من المفضلة"
+    await message.reply_audio(
+        audio=file_id,
+        title=title,
+        performer="YouTube",
+        caption=success_caption(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(button, callback_data=f"fav:{favorite_callback_key(query or title)}")]
+        ]),
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=15,
+        pool_timeout=15,
+    )
+
+
+async def handle_request(message, query: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    register_user(getattr(message, "from_user", None))
+    if setting_get("bot_enabled", "1") != "1" and not is_developer(getattr(message.from_user, "id", None)):
+        await message.reply_text("🔴 البوت متوقف مؤقتًا من قبل الإدارة.")
+        return False
+    play_photo = setting_get("play_photo")
+    if play_photo:
+        status = await message.reply_photo(photo=play_photo, caption="🪄")
+    else:
+        status = await message.reply_text("🪄")
+
+    # مؤثر حالة الطلب: 🪄 → 🎼 → 🎵
+    try:
+        await asyncio.sleep(0.35)
+        await status.edit_caption(caption="🎼") if play_photo else await status.edit_text("🎼")
+        await asyncio.sleep(0.35)
+        await status.edit_caption(caption="🎵") if play_photo else await status.edit_text("🎵")
+    except Exception:
+        pass
+
+    async def progress_loop():
+        # يعطي المستخدم استجابة واضحة بدل بقاء الرسالة ثابتة أثناء YouTube.
+        frames = ["🪄", "🪄", "🪄"]
+        i = 0
+        while True:
+            await asyncio.sleep(1.6)
+            i = (i + 1) % len(frames)
+            try:
+                if status.photo:
+                    await status.edit_caption(caption=frames[i], parse_mode=ParseMode.HTML)
+                else:
+                    await status.edit_text(frames[i], parse_mode=ParseMode.HTML)
+            except Exception:
+                return
+
+    progress_task = asyncio.create_task(progress_loop())
+    workdir = tempfile.mkdtemp(prefix="ytbot_")
+    try:
+        # هذه هي حالة 1-2 ثانية: Telegram يعيد إرسال الملف من file_id دون YouTube.
+        cached = cache_get(query)
+        if cached:
+            try:
+                await send_cached(message, cached[0], cached[1], query)
+                add_download_history(message.from_user.id, query, cached[0], cached[2], True)
+                increment_downloads()
+                return True
+            except Exception as exc:
+                logger.warning("cached file_id failed; invalidating cache entry and re-downloading: %s", exc)
+                # لا نترك file_id تالفًا في قاعدة البيانات؛ وإلا ستفشل الأغنية
+                # نفسها في كل مرة. نحذف سجل الأغنية فقط ولا نحذف بقية الكاش.
+                with sqlite3.connect(CACHE_DB) as db:
+                    db.execute(
+                        "DELETE FROM music_cache WHERE query_key=?",
+                        (normalize_query(query),),
+                    )
+                    db.commit()
+
+        async with DOWNLOAD_SEMAPHORE:
+            await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            path, title, source_url, duration = await asyncio.to_thread(
+                download_audio_sync, query, workdir
+            )
+
+        if os.path.getsize(path) > MAX_FILE_SIZE_BYTES:
+            raise BotError(f"الملف أكبر من الحد المسموح {MAX_FILE_SIZE_MB} MB.")
+
+        with open(path, "rb") as audio_file:
+            sent = await message.reply_audio(
+                audio=audio_file,
+                title=title,
+                performer="YouTube",
+                caption=success_caption(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⭐ مُفضلة", callback_data=f"fav:{favorite_callback_key(query)}")]
+                ]),
+                read_timeout=180,
+                write_timeout=180,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+
+        if sent.audio and sent.audio.file_id:
+            cache_file = MUSIC_CACHE_DIR / f"{abs(hash(normalize_query(query)))}{Path(path).suffix.lower()}"
+            try:
+                shutil.copy2(path, cache_file)
+            except Exception:
+                cache_file = Path(path)
+            cache_put(
+                query, title, sent.audio.file_id, sent.audio.file_unique_id,
+                source_url, duration, os.path.getsize(path), str(cache_file)
+            )
+            add_download_history(message.from_user.id, query, title, source_url, False)
+            increment_downloads()
+            await notify_developer(
+                context,
+                f"🎵 تحميل جديد\\n👤 المستخدم: {message.from_user.id}\\n🎶 {title}"
+            )
+        return True
+
+    except BotError as exc:
+        # رسالة موحدة عند تعذر توفير الأغنية، مع أزرار المطور والبوت.
+        bot_username = (getattr(context.bot, "username", None) or "").strip().lstrip("@")
+        keyboard_rows = [[
+            InlineKeyboardButton("🔴 المطوّر @sjxn_200", url="https://t.me/sjxn_200")
+        ]]
+        if bot_username:
+            keyboard_rows.append([
+                InlineKeyboardButton(f"🔵 البوت @{bot_username}", url=f"https://t.me/{bot_username}")
+            ])
+        await message.reply_text(
+            f"للأسف، الأغنية «{clean_title(query)}» مفروضة عليها قيود من البوت لسبب شخصي.",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+    except Exception as exc:
+        # لا نسمح لفشل طلب واحد بإنهاء معالج التحديثات؛ نسجل traceback للتشخيص.
+        logger.exception("download/send failed for query=%r user_id=%s", query, getattr(getattr(message, "from_user", None), "id", None))
+        try:
+            await message.reply_text(f"فشل تنفيذ الطلب، والبوت ما زال يعمل:\n{short_error(exc)}")
+        except Exception:
+            logger.exception("could not send request-failure message to Telegram")
+        return False
+    finally:
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+
+async def notify_developer(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    if setting_get("notifications_enabled", "0") != "1":
+        return
+    group_id = setting_get("notifications_group", "")
+    if not group_id:
+        return
+    try:
+        await context.bot.send_message(chat_id=int(group_id), text=text)
+    except Exception as exc:
+        logger.warning("notification failed: %s", exc)
+
+
+def increment_downloads() -> None:
+    try:
+        value = int(setting_get("download_count", "0")) + 1
+    except ValueError:
+        value = 1
+    setting_set("download_count", str(value))
+
+
+def website_button() -> InlineKeyboardButton:
+    # زر أخضر في إصدارات Telegram/المكتبة الحديثة، مع fallback للإصدارات الأقدم.
+    try:
+        return InlineKeyboardButton("🌐 الموقع الرسمي", url=WEBSITE_URL, style="success")
+    except TypeError:
+        return InlineKeyboardButton("🌐 الموقع الرسمي", url=WEBSITE_URL)
+
+
+def developer_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📥 سجل التحميلات", callback_data="my_history"),
+            InlineKeyboardButton("⭐ مُفضلتك", callback_data="my_favorites"),
+        ],
+        [InlineKeyboardButton("⚙️ قسم المطور", callback_data="dev_panel")],
+    ])
+
+
+def developer_panel_keyboard() -> InlineKeyboardMarkup:
+    # عند الضغط على «قسم المطور» تظهر لوحة المطور الكاملة.
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="dev_stats")],
+        [InlineKeyboardButton("🎵 Music Operations Center", callback_data="music_ops")],
+        [InlineKeyboardButton("👥 نظام المستخدمين", callback_data="dev_users"),
+         InlineKeyboardButton("👥 الكروبات والقنوات", callback_data="dev_chats")],
+        [InlineKeyboardButton("🚀 تطوير البوت", callback_data="dev_development")],
+        [InlineKeyboardButton("👨‍💻 المطورون الثانويون", callback_data="secondary_devs")],
+        [InlineKeyboardButton("💾 نسخة احتياطية", callback_data="backup_bot"),
+         InlineKeyboardButton("🔄 نظام التحديث", callback_data="update_bot")],
+        [InlineKeyboardButton("🧬 إنشاء نسخة بتوكن جديد", callback_data="clone_bot")],
+        [InlineKeyboardButton("🛠️ نظام التحسين", callback_data="optimize_bot")],
+        [InlineKeyboardButton("🔒 الاشتراك الإجباري", callback_data="force_subscriptions")],
+        [InlineKeyboardButton("📣 نظام الإذاعة", callback_data="broadcast_menu")],
+        [InlineKeyboardButton("📢 تغيير قناة البوت", callback_data="set_channel"),
+         InlineKeyboardButton("🖼️ صورة الستارت", callback_data="set_start_photo")],
+        [InlineKeyboardButton("▶️ صورة التشغيل", callback_data="set_play_photo"),
+         InlineKeyboardButton("🚫 تعطيل صورة التشغيل", callback_data="disable_play_photo"),
+         InlineKeyboardButton("🔔 مجموعة الإشعارات", callback_data="set_notify_group")],
+        [InlineKeyboardButton("👑 تغيير المالك", callback_data="set_owner")],
+        [InlineKeyboardButton("🔔 تفعيل الإشعارات", callback_data="notifications_on"),
+         InlineKeyboardButton("🔕 تعطيل الإشعارات", callback_data="notifications_off")],
+        [InlineKeyboardButton("📣 تفعيل الإعلان", callback_data="ads_on"),
+         InlineKeyboardButton("🚫 تعطيل الإعلان", callback_data="ads_off")],
+        [InlineKeyboardButton("🟢 تفعيل البوت", callback_data="bot_on"),
+         InlineKeyboardButton("🔴 تعطيل البوت", callback_data="bot_off")],
+        [InlineKeyboardButton("🗑️ تنظيف الكاش", callback_data="cache_clean")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="dev_back")],
+    ])
+
+
+async def edit_developer_message(query, text, reply_markup):
+    # زر المطور قد يكون مرفقًا بصورة الستارت، لذلك نعدل الكابشن إذا كانت الرسالة صورة.
+    if getattr(query.message, "photo", None):
+        await query.edit_message_caption(
+            caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+    else:
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+
+
+async def show_developer_panel(query, edit=True):
+    text = (
+        "👨‍💻 <b>قسم المطور</b>\n\n"
+        "اختر الإعداد الذي تريد إدارته:"
+    )
+    if edit:
+        await edit_developer_message(query, text, developer_panel_keyboard())
+    else:
+        await query.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                       reply_markup=developer_panel_keyboard())
+
+
+def secondary_developer_list():
+    with sqlite3.connect(CACHE_DB) as db:
+        return db.execute("SELECT user_id, added_at FROM secondary_developers ORDER BY added_at DESC").fetchall()
+
+
+def create_backup_archive() -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_dir = BASE_DIR / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    archive = backup_dir / f"bot_backup_{stamp}.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(CACHE_DB, "music_cache.db")
+        zf.write(Path(__file__), Path(__file__).name)
+        # Do not include .env: it contains the live bot token.
+        requirements = BASE_DIR / "requirements.txt"
+        if requirements.exists():
+            zf.write(requirements, "requirements.txt")
+        env_example = BASE_DIR / ".env.example"
+        if env_example.exists():
+            zf.write(env_example, ".env.example")
+        if MUSIC_CACHE_DIR.exists():
+            for f in MUSIC_CACHE_DIR.rglob("*"):
+                if f.is_file():
+                    zf.write(f, str(Path("music_cache") / f.relative_to(MUSIC_CACHE_DIR)))
+    return archive
+
+
+def create_clone_archive(new_token: str) -> Path:
+    """ينشئ حزمة تشغيل مطابقة مع توكن جديد وبدون الاعتماد على توكن النسخة الأصلية."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_dir = BASE_DIR / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    archive = backup_dir / f"bot_clone_{stamp}.zip"
+    source = Path(__file__)
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(source, source.name)
+        if CACHE_DB.exists():
+            zf.write(CACHE_DB, "music_cache.db")
+        if MUSIC_CACHE_DIR.exists():
+            for f in MUSIC_CACHE_DIR.rglob("*"):
+                if f.is_file():
+                    zf.write(f, str(Path("music_cache") / f.relative_to(MUSIC_CACHE_DIR)))
+        zf.writestr(".env", f"BOT_TOKEN={new_token}\n")
+        zf.writestr("requirements.txt", "python-telegram-bot>=20.8,<23\nyt-dlp>=2025.1.15\npython-dotenv>=1.0.1\n")
+        zf.writestr("README.txt", "شغّل: pip install -r requirements.txt ثم python3 " + source.name + "\n")
+    return archive
+
+
+async def validate_bot_token(token: str) -> bool:
+    bot = Bot(token=token)
+    try:
+        await bot.initialize()
+        await bot.get_me()
+        return True
+    except TelegramError:
+        return False
+    finally:
+        try:
+            await bot.shutdown()
+        except Exception:
+            pass
+
+
+def optimize_database() -> str:
+    with sqlite3.connect(CACHE_DB) as db:
+        integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            return f"❌ فشل فحص قاعدة البيانات: {integrity}"
+        db.execute("PRAGMA optimize")
+        db.execute("VACUUM")
+        db.commit()
+    removed = 0
+    known = set()
+    with sqlite3.connect(CACHE_DB) as db:
+        for (path,) in db.execute("SELECT cache_path FROM music_cache WHERE cache_path IS NOT NULL").fetchall():
+            if path:
+                known.add(str(Path(path).resolve()))
+    if MUSIC_CACHE_DIR.exists():
+        for f in MUSIC_CACHE_DIR.rglob("*"):
+            if f.is_file() and str(f.resolve()) not in known:
+                try:
+                    f.unlink(); removed += 1
+                except OSError:
+                    pass
+    return f"✅ تم التحسين بنجاح.\n🧹 ملفات كاش غير مرتبطة: {removed}"
+
+
+def broadcast_targets(kind: str):
+    with sqlite3.connect(CACHE_DB) as db:
+        if kind == "private":
+            return [r[0] for r in db.execute("SELECT user_id FROM users WHERE status != 'blocked'").fetchall()]
+        if kind == "groups":
+            return [r[0] for r in db.execute("SELECT chat_id FROM managed_chats WHERE chat_type LIKE '%كروب%' AND last_status='added'").fetchall()]
+        if kind == "channels":
+            return [r[0] for r in db.execute("SELECT chat_id FROM managed_chats WHERE chat_type LIKE '%قناة%' AND last_status='added'").fetchall()]
+        private = [r[0] for r in db.execute("SELECT user_id FROM users WHERE status != 'blocked'").fetchall()]
+        chats = [r[0] for r in db.execute("SELECT chat_id FROM managed_chats WHERE last_status='added'").fetchall()]
+        return private + chats
+
+
+def broadcast_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 للخاص", callback_data="broadcast_private"), InlineKeyboardButton("👥 للكروبات", callback_data="broadcast_groups")],
+        [InlineKeyboardButton("📣 للقنوات", callback_data="broadcast_channels"), InlineKeyboardButton("🌐 للجميع", callback_data="broadcast_all")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="dev_panel")],
+    ])
+
+
+async def developer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    user_id = q.from_user.id
+    action = q.data
+    await q.answer()
+
+    # User features
+    if action == "my_favorites":
+        rows = favorite_list(user_id)
+        if not rows:
+            await q.message.reply_text("⭐ لا توجد أغاني في المفضلة حاليًا.")
+            return
+        lines = ["⭐ <b>مُفضلتك</b>\n"]
+        for i, (title, key, file_id) in enumerate(rows[:20], 1):
+            lines.append(f"{i}. 🎵 {title}")
+        await q.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    if action == "my_history":
+        rows = history_list(user_id, 15)
+        if not rows:
+            await q.message.reply_text("📥 لا يوجد سجل تحميلات حتى الآن.")
+            return
+        lines = ["📥 <b>سجل التحميلات</b>\n"]
+        for i, (title, created_at, from_cache) in enumerate(rows, 1):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(created_at))
+            source = "⚡ كاش" if from_cache else "⬇️ تحميل"
+            lines.append(f"{i}. {title}\n   {source} • {when}")
+        await q.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    if action.startswith("fav:"):
+        token = action[4:]
+        query_key = None
+
+        # نحل المفتاح القصير إلى query_key الحقيقي؛ لا نضع نص البحث نفسه داخل callback_data.
+        with sqlite3.connect(CACHE_DB) as db:
+            favorite_rows = db.execute(
+                "SELECT query_key FROM favorites WHERE user_id=?", (user_id,)
+            ).fetchall()
+            for (candidate,) in favorite_rows:
+                if favorite_callback_key(candidate) == token:
+                    query_key = candidate
+                    break
+
+            if query_key is None:
+                cache_rows = db.execute(
+                    "SELECT query_key FROM music_cache"
+                ).fetchall()
+                for (candidate,) in cache_rows:
+                    if favorite_callback_key(candidate) == token:
+                        query_key = candidate
+                        break
+
+        if not query_key:
+            await q.answer("⚠️ الأغنية لم تعد موجودة في الكاش.", show_alert=True)
+            return
+
+        if favorite_has(user_id, query_key):
+            favorite_remove(user_id, query_key)
+            await q.answer("تم إزالتها من المفضلة")
+            try:
+                await q.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "⭐ مُفضلة",
+                            callback_data=f"fav:{favorite_callback_key(query_key)}"
+                        )]
+                    ])
+                )
+            except Exception:
+                pass
+            return
+
+        with sqlite3.connect(CACHE_DB) as db:
+            row = db.execute(
+                "SELECT title, telegram_file_id FROM music_cache WHERE query_key=?",
+                (query_key,)
+            ).fetchone()
+
+        if row:
+            favorite_add(user_id, query_key, row[0], row[1])
+            await q.answer("تمت إضافتها إلى المفضلة")
+            try:
+                await q.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "💫 إزالة من المفضلة",
+                            callback_data=f"fav:{favorite_callback_key(query_key)}"
+                        )]
+                    ])
+                )
+            except Exception:
+                pass
+        else:
+            await q.answer("⚠️ الأغنية لم تعد موجودة في الكاش.", show_alert=True)
+        return
+
+    if action == "check_subscription":
+        if await is_user_subscribed(context, user_id):
+            await q.answer("✅ تم التحقق، يمكنك استخدام البوت الآن.", show_alert=True)
+            await q.message.reply_text("✅ تم التحقق من اشتراكك. أرسل طلبك الآن.")
+        else:
+            await q.answer("❌ لم يكتمل الاشتراك في كل القنوات.", show_alert=True)
+        return
+
+    # Developer-only features
+    if not is_developer(user_id):
+        await q.answer("🚫 غير مصرح لك.", show_alert=True)
+        return
+
+    if action == "dev_panel":
+        context.user_data.pop("dev_action", None)
+        await show_developer_panel(q)
+        return
+
+    if action in {"music_ops", "music_ops_refresh"}:
+        try:
+            payload = await asyncio.to_thread(website_call, "GET", "/api/bot/requests?limit=8")
+            website_requests = payload.get("requests", [])
+            status_counts = {"queued": 0, "processing": 0, "accepted": 0, "failed": 0}
+            for item in website_requests:
+                status = str(item.get("status", "failed"))
+                if status in status_counts:
+                    status_counts[status] += 1
+                elif status == "bot_activation_required":
+                    status_counts["failed"] += 1
+            website_line = "\n".join(
+                f"• {str(item.get('query', 'طلب'))[:42]} — {item.get('status', 'unknown')}"
+                for item in website_requests[:6]
+            ) or "لا توجد طلبات في طابور الموقع."
+            website_error = ""
+        except Exception as exc:
+            status_counts = {"queued": 0, "processing": 0, "accepted": 0, "failed": 0}
+            website_line = "تعذر قراءة طابور الموقع حاليًا."
+            website_error = f"\n⚠️ {short_error(exc)[:120]}"
+        _, _, _, songs, cache_size, downloads, favorites, history, _ = stats()
+        text = (
+            "🎵 <b>Music Operations Center</b>\n\n"
+            "<b>طابور الموقع</b>\n"
+            f"⏳ بانتظار البوت: <b>{status_counts['queued']}</b>\n"
+            f"⚙️ قيد المعالجة: <b>{status_counts['processing']}</b>\n"
+            f"✅ تم الإرسال: <b>{status_counts['accepted']}</b>\n"
+            f"⚠️ يحتاج متابعة: <b>{status_counts['failed']}</b>\n\n"
+            f"<b>آخر العمليات</b>\n{website_line}{website_error}\n\n"
+            "<b>المحرك المحلي</b>\n"
+            f"🎼 الكاش: <b>{songs}</b> · 💾 {format_size(cache_size)}\n"
+            f"📥 التحميلات: <b>{downloads}</b> · ⭐ المفضلات: <b>{favorites}</b> · 🧾 السجل: <b>{history}</b>"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 تحديث العمليات", callback_data="music_ops_refresh")],
+            [InlineKeyboardButton("⬅️ مركز المطور", callback_data="dev_panel")],
+        ])
+        await edit_developer_message(q, text, markup)
+        return
+
+    if action == "secondary_devs":
+        rows = secondary_developer_list()
+        text = "👨‍💻 <b>المطورون الثانويون</b>\n\n"
+        if rows:
+            text += "\n".join(f"• <code>{uid}</code>" for uid, _ in rows)
+        else:
+            text += "لا يوجد مطور ثانوي حاليًا."
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ إضافة مطور ثانوي", callback_data="add_secondary_dev")],
+            [InlineKeyboardButton("🗑️ حذف مطور ثانوي", callback_data="remove_secondary_dev")],
+            [InlineKeyboardButton("⬅️ رجوع", callback_data="dev_panel")],
+        ])
+        await edit_developer_message(q, text, markup)
+        return
+
+    if action in {"add_secondary_dev", "remove_secondary_dev"}:
+        context.user_data["dev_action"] = action
+        prompt = "➕ أرسل آيدي المطور الثانوي لإضافته." if action == "add_secondary_dev" else "🗑️ أرسل آيدي المطور الثانوي لحذفه."
+        await edit_developer_message(q, prompt, developer_panel_keyboard())
+        return
+
+    if action == "backup_bot":
+        archive = create_backup_archive()
+        with archive.open("rb") as fh:
+            await q.message.reply_document(document=fh, caption="💾 تم إنشاء النسخة الاحتياطية الكاملة.")
+        return
+
+    if action == "clone_bot":
+        context.user_data["dev_action"] = "clone_bot"
+        await q.message.reply_text("🧬 أرسل توكن البوت الجديد من BotFather. لن يتم حفظه في قاعدة بيانات البوت الحالي.")
+        return
+
+    if action == "force_subscriptions":
+        channels = force_subscription_channels()
+        enabled = setting_get("force_subscription_enabled", "1") == "1"
+        text = "🔒 <b>إدارة الاشتراك الإجباري</b>\n\n"
+        text += "الحالة: " + ("مفعلة" if enabled else "معطلة") + "\n"
+        text += "\n".join(f"• {title} — <code>{cid}</code>" for cid, title, _, _ in channels) or "لا توجد قنوات مضافة."
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ إضافة قناة", callback_data="force_add")],
+            [InlineKeyboardButton("➖ حذف قناة", callback_data="force_remove")],
+            [InlineKeyboardButton("🔄 تفعيل/تعطيل", callback_data="force_toggle")],
+            [InlineKeyboardButton("⬅️ رجوع", callback_data="dev_panel")],
+        ])
+        await edit_developer_message(q, text, markup)
+        return
+
+    if action in {"force_add", "force_remove"}:
+        context.user_data["dev_action"] = action
+        prompt = ("➕ أرسل @username أو آيدي القناة لإضافتها. للقناة الخاصة أرسل: آيدي القناة|رابط الدعوة."
+                  if action == "force_add" else "➖ أرسل @username أو آيدي القناة لحذفها.")
+        await q.message.reply_text(prompt)
+        return
+
+    if action == "force_toggle":
+        setting_set("force_subscription_enabled", "0" if setting_get("force_subscription_enabled", "1") == "1" else "1")
+        await show_developer_panel(q)
+        return
+
+    if action == "update_bot":
+        context.user_data["dev_action"] = "update_bot"
+        await q.message.reply_text("🔄 أرسل ملف Python الجديد (.py). سيتم فحصه أولًا ثم حفظ نسخة احتياطية قبل استبداله.")
+        return
+
+    if action == "optimize_bot":
+        result = optimize_database()
+        await q.message.reply_text(result, reply_markup=developer_panel_keyboard())
+        return
+
+    if action == "broadcast_menu":
+        await edit_developer_message(q, "📣 <b>نظام الإذاعة</b>\n\nاختر جهة الإرسال:", broadcast_keyboard())
+        return
+
+    if action in {"broadcast_private", "broadcast_groups", "broadcast_channels", "broadcast_all"}:
+        context.user_data["dev_action"] = action
+        labels = {"broadcast_private":"الخاص", "broadcast_groups":"الكروبات", "broadcast_channels":"القنوات", "broadcast_all":"الجميع"}
+        await q.message.reply_text(f"📣 أرسل الآن الرسالة التي تريد إذاعتها إلى {labels[action]}.")
+        return
+
+    if action == "dev_back":
+        context.user_data.pop("dev_action", None)
+        text = (
+            "أرسل: يوت اسم الأغنية\n"
+            "أو: /yt اسم الأغنية\n"
+            "في الخاص أو المجموعة. في القناة اجعل البوت مشرفًا.\n\n"
+            "👨‍💻 قسم المطور"
+        )
+        await edit_developer_message(q, text, developer_keyboard())
+        return
+
+    if action == "dev_stats":
+        total, new_users, active, songs, cache_size, downloads, favorites, history, chats = stats()
+        text = (
+            "📊 <b>إحصائيات البوت</b>\n\n"
+            f"👥 إجمالي المستخدمين: <b>{total}</b>\n"
+            f"📅 المستخدمون الجدد: <b>{new_users}</b>\n"
+     
